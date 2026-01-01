@@ -15,6 +15,7 @@ struct ContentView: View {
     // 匯出與版本相關
     @State private var selectedHistory: TeamHistory?
     @State private var exportedString = ""
+    @State private var exportedLockId = 0
     @State private var showingExportAlert = false
     @State private var showingResetAlert = false
     
@@ -60,7 +61,7 @@ struct ContentView: View {
                     Button("複製") { UIPasteboard.general.string = exportedString }
                     Button("關閉", role: .cancel) { }
                 } message: {
-                    Text("已產生加密字串 (v\(selectedHistory?.lockId ?? selectedDevice?.lockId ?? 0))")
+                    Text("已產生加密字串 (v\(exportedLockId))")
                 }
                 .alert("新裝置連線", isPresented: $showingDeviceNameInput) {
                     TextField("裝置名稱", text: $newDeviceName)
@@ -92,9 +93,6 @@ struct ContentView: View {
                     if selectedDevice == nil { selectedDevice = devices.first }
                     updateTOTP()
                 }
-                .onChange(of: selectedDevice) { _ in
-                    selectedHistory = nil
-                }
         }
     }
 
@@ -113,6 +111,10 @@ struct ContentView: View {
             return dtos.map { $0.toDisplayModel() }
         }
         return team.map { $0.toDisplayModel() }
+    }
+    
+    var allHistories: [TeamHistory] {
+        devices.flatMap { $0.history }.sorted { $0.timestamp > $1.timestamp }
     }
 
     var teamSection: some View {
@@ -153,11 +155,9 @@ struct ContentView: View {
             HStack {
                 // 左側：版本選擇 (下拉選單)
                 Picker("版本", selection: $selectedHistory) {
-                    Text("最新 (v\(selectedDevice?.lockId ?? 0))").tag(nil as TeamHistory?)
-                    if let device = selectedDevice {
-                        ForEach(device.history.sorted(by: { $0.timestamp > $1.timestamp })) { history in
-                            Text("v\(history.lockId) (\(formatDate(history.timestamp)))").tag(history as TeamHistory?)
-                        }
+                    Text("最新").tag(nil as TeamHistory?)
+                    ForEach(allHistories) { history in
+                        Text("v\(history.lockId) (\(formatDate(history.timestamp)))").tag(history as TeamHistory?)
                     }
                 }
                 .labelsHidden()
@@ -209,9 +209,12 @@ struct ContentView: View {
         } else {
             // Export current
             dtos = team.map { $0.toDTO() }
-            lockId = selectedDevice?.lockId ?? 0
+            // Use the lockId from the latest history
+            lockId = allHistories.first?.lockId ?? 0
             timestamp = Date().timeIntervalSince1970
         }
+        
+        exportedLockId = lockId
         
         let payload = SyncPayload(
             secret: "", // Secret is not exported
@@ -270,7 +273,14 @@ struct ContentView: View {
                 // 否則執行完整同步
                 SyncService.saveDevice(payload: payload, name: existing.name, context: modelContext)
                 SyncService.saveParty(payload: payload, context: modelContext)
-                self.selectedDevice = existing
+                
+                // 重新抓取以確保 UI 獲取最新的歷史紀錄
+                if let updatedDevice = try? modelContext.fetch(descriptor).first {
+                    self.selectedDevice = updatedDevice
+                } else {
+                    self.selectedDevice = existing
+                }
+                
                 updateTOTP() // 立即更新
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
                 self.pendingPayload = nil
