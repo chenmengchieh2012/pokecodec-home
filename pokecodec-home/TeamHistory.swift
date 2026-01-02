@@ -7,8 +7,6 @@ final class TeamHistory {
     var lockId: Int
     var teamJson: Data
     
-    var device: ConnectedDevice?
-    
     init(timestamp: Double, lockId: Int, teamJson: Data) {
         self.timestamp = timestamp
         self.lockId = lockId

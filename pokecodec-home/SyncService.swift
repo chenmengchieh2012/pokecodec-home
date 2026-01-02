@@ -40,14 +40,27 @@ struct PokemonSyncDTO: Codable {
     let codingStats: CodingStats?
 }
 
+enum SyncType: String, Codable {
+    case party
+    case achievement
+    case bindSetup
+}
+
 struct SyncPayload: Codable {
     let secret: String
+    let type: SyncType?
     let party: [PokemonSyncDTO]?
     let lockId: Int
     let timestamp: Double?
 }
 
 struct SyncService {
+    static func getTimeHash(_ timestamp: Double) -> String {
+        let data = Data(String(timestamp).utf8)
+        let hash = SHA256.hash(data: data)
+        return String(hash.compactMap { String(format: "%02x", $0) }.joined().prefix(6))
+    }
+
     @MainActor
     static func decodePayload(base64: String) -> SyncPayload? {
         // 1. 清理字串
@@ -107,38 +120,15 @@ struct SyncService {
                 device = newDevice
             }
             
-            // 儲存歷史紀錄 (只有當有隊伍資料且 lockId 非負值時)
-            if let party = payload.party, 
-               payload.lockId >= 0,
-               let timestamp = payload.timestamp,
-               let teamData = try? JSONEncoder().encode(party) {
-                
-                // 檢查是否已經存在相同的 lockId (避免重複儲存)
-                if !device.history.contains(where: { $0.lockId == payload.lockId }) {
-                    let history = TeamHistory(timestamp: timestamp, lockId: payload.lockId, teamJson: teamData)
-                    device.history.append(history)
-                    
-                    // 排序並保留最新的 5 筆
-                    device.history.sort { $0.timestamp > $1.timestamp }
-                    if device.history.count > 5 {
-                        let toDelete = device.history.suffix(from: 5)
-                        for item in toDelete {
-                            context.delete(item)
-                        }
-                        device.history.removeSubrange(5...)
-                    }
-                }
-            }
-            
             try context.save()
-            print("✅ 裝置資訊與歷史紀錄已儲存: \(name)")
+            print("✅ 裝置資訊已儲存: \(name)")
         } catch {
             print("❌ 儲存裝置資訊失敗: \(error)")
         }
     }
 
     @MainActor // 確保在主執行緒執行，UI 才能即時反應
-    static func saveParty(payload: SyncPayload, context: ModelContext) {
+    static func saveParty(payload: SyncPayload, context: ModelContext, githubToken: String, gistIdKey: String = "PokecodecGistId") {
         guard let dtos = payload.party else {
             print("⚠️ Payload 中沒有隊伍資料，跳過儲存隊伍")
             return
@@ -187,6 +177,60 @@ struct SyncService {
                 context.insert(new)
             }
             
+            // 3. 儲存歷史紀錄 (全域最多 5 筆)
+            if payload.lockId >= 0,
+               let timestamp = payload.timestamp,
+               let teamData = try? JSONEncoder().encode(dtos) {
+                
+                let history = TeamHistory(timestamp: timestamp, lockId: payload.lockId, teamJson: teamData)
+                context.insert(history)
+                
+                // 檢查數量並刪除舊的
+                let allHistoryDescriptor = FetchDescriptor<TeamHistory>(sortBy: [SortDescriptor(\.timestamp, order: .reverse)])
+                if let allHistories = try? context.fetch(allHistoryDescriptor), allHistories.count > 5 {
+                    let toDelete = allHistories.suffix(from: 5)
+                    for item in toDelete {
+                        context.delete(item)
+                            
+                            // 同步刪除 Gist 上的檔案
+                            let hash = getTimeHash(item.timestamp)
+                            let filename = "pokecodec-party-\(hash).txt"
+                            deleteFromGist(filename: filename, token: githubToken, gistIdKey: gistIdKey) { result in
+                                if case .failure(let error) = result {
+                                    print("❌ Failed to delete file from Gist: \(error)")
+                                } else {
+                                    print("🗑️ Deleted file from Gist: \(filename)")
+                                }
+                            }
+                        }
+                    }
+                print("✅ 已新增歷史紀錄 (v\(payload.lockId))")
+                
+                // 上傳至 GitHub Gist (壓縮格式)
+                let exportPayload = SyncPayload(
+                    secret: "", 
+                    type: payload.type,
+                    party: payload.party,
+                    lockId: payload.lockId,
+                    timestamp: timestamp
+                )
+                
+                if let compressed = try? JSONEncoder().encode(exportPayload).gzipped() {
+                    let content = "GZIP:" + compressed.base64EncodedString()
+                    let hash = getTimeHash(timestamp)
+                    let filename = "pokecodec-party-\(hash).txt"
+                    
+                    uploadToGist(content: content, filename: filename, token: githubToken, gistIdKey: gistIdKey) { result in
+                        switch result {
+                        case .success(let url):
+                            print("✅ Gist uploaded/updated: \(url)")
+                        case .failure(let error):
+                            print("❌ Gist upload failed: \(error)")
+                        }
+                    }
+                }
+            }
+            
             // 修正點 2: 手動提交變更
             try context.save()
             print("✅ SwiftData 儲存成功")
@@ -194,5 +238,121 @@ struct SyncService {
         } catch {
             print("❌ 同步過程出錯: \(error)")
         }
+    }
+    
+    static func uploadToGist(content: String, filename: String, token: String, gistIdKey: String, completion: @escaping (Result<URL, Error>) -> Void) {
+        let storedGistId = UserDefaults.standard.string(forKey: gistIdKey)
+        
+        let url: URL
+        let method: String
+        
+        if let gistId = storedGistId {
+            url = URL(string: "https://api.github.com/gists/\(gistId)")!
+            method = "PATCH"
+        } else {
+            url = URL(string: "https://api.github.com/gists")!
+            method = "POST"
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.addValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.addValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        
+        let body: [String: Any] = [
+            "description": "Uploaded from PokéCodec",
+            "public": false,
+            "files": [
+                filename: [
+                    "content": content
+                ]
+            ]
+        ]
+        
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            
+            if let httpResponse = response as? HTTPURLResponse {
+                if httpResponse.statusCode == 404 && method == "PATCH" {
+                    // Gist ID 失效，清除並重試 (遞迴呼叫會變成 POST)
+                    UserDefaults.standard.removeObject(forKey: gistIdKey)
+                    uploadToGist(content: content, filename: filename, token: token, gistIdKey: gistIdKey, completion: completion)
+                    return
+                }
+                
+                if !(200...299).contains(httpResponse.statusCode) {
+                    let msg = String(data: data ?? Data(), encoding: .utf8) ?? "Unknown error"
+                    completion(.failure(NSError(domain: "GistError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "GitHub API Error: \(msg)"])))
+                    return
+                }
+            }
+            
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let htmlUrlString = json["html_url"] as? String,
+                  let htmlUrl = URL(string: htmlUrlString),
+                  let id = json["id"] as? String else {
+                completion(.failure(NSError(domain: "GistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to parse response"])))
+                return
+            }
+            
+            // 儲存 Gist ID 以供下次更新使用
+            UserDefaults.standard.set(id, forKey: gistIdKey)
+            
+            completion(.success(htmlUrl))
+        }.resume()
+    }
+    
+    static func deleteFromGist(filename: String, token: String, gistIdKey: String, completion: @escaping (Result<Bool, Error>) -> Void) {
+        guard let gistId = UserDefaults.standard.string(forKey: gistIdKey) else {
+            completion(.failure(NSError(domain: "GistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "No Gist ID found"])))
+            return
+        }
+        
+        let url = URL(string: "https://api.github.com/gists/\(gistId)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.addValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.addValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        
+        // To delete a file, set it to null
+        let body: [String: Any] = [
+            "files": [
+                filename: NSNull()
+            ]
+        ]
+        
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            
+            if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
+                completion(.failure(NSError(domain: "GistError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: "GitHub API Error"])))
+                return
+            }
+            
+            completion(.success(true))
+        }.resume()
     }
 }
