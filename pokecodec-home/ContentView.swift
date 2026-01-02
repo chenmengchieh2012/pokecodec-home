@@ -3,6 +3,7 @@ import SwiftData
 import Combine
 import VisionKit
 import CryptoKit
+import WebKit
 
 struct ContentView: View {
     @Query(sort: \Pokemon.pokedexId) var team: [Pokemon]
@@ -10,522 +11,532 @@ struct ContentView: View {
     @Query(sort: \TeamHistory.timestamp, order: .reverse) var histories: [TeamHistory]
     @Environment(\.modelContext) private var modelContext
 
-    @State private var isShowingScanner = false
-    @State private var selectedPokemon: Pokemon?
-    
-    // 匯出與版本相關
-    @State private var selectedHistory: TeamHistory?
-    @State private var exportedString = ""
-    @State private var exportedLockId = 0
-    @State private var showingExportAlert = false
-    
-    // 設定
+    // --- AppStorage 設定 ---
     @AppStorage("githubToken") private var githubToken = ""
     @AppStorage("PokecodecGistId") private var gistId = "YOUR_DEFAULT_GIST_ID"
-    @State private var showingSettings = false
     
-    // 2FA 相關
+    @State private var isShowingScanner = false
+    @State private var selectedHistory: TeamHistory?
+    @State private var showingSettings = false
     @StateObject private var totpManager = TOTPManager()
     @State private var selectedDevice: ConnectedDevice?
     @State private var totpCode: String = "--- ---"
-    @State private var timeRemaining: Int = 30
-    let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
-    // 處理掃描
+    @State private var timeRemaining = 30
+    
+    // 導航與交互
+    @State private var showingExportAlert = false
+    @State private var exportedString = ""
+    @State private var exportedLockId = 0
+    
+    // 處理掃描與設備綁定
     @State private var pendingPayload: SyncPayload?
     @State private var showingDeviceNameInput = false
     @State private var newDeviceName = ""
-
-    var body: some View {
-        NavigationView {
-            mainList
-                .navigationTitle("PokéCodec")
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarLeading) {
-                        Button(action: { showingSettings = true }) {
-                            Image(systemName: "gearshape")
-                        }
-                    }
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button(action: { isShowingScanner = true }) {
-                            Image(systemName: "qrcode.viewfinder").font(.title2)
-                        }
-                    }
-                }
-                .sheet(isPresented: $isShowingScanner) {
-                    // Scanner 視圖邏輯保持不變
-                    ScannerSheet(isShowing: $isShowingScanner) { handleQRCodeScanned($0) }
-                }
-                .sheet(isPresented: $showingSettings) {
-                    SettingsView(githubToken: $githubToken, gistId: $gistId, onReset: resetAll)
-                }
-                .alert("匯出資料", isPresented: $showingExportAlert) {
-                    Button("複製") { UIPasteboard.general.string = exportedString }
-                    Button("關閉", role: .cancel) { }
-                } message: {
-                    Text("已產生加密字串 (v\(exportedLockId))")
-                }
-                .alert("新裝置連線", isPresented: $showingDeviceNameInput) {
-                    TextField("裝置名稱", text: $newDeviceName)
-                    Button("取消", role: .cancel) { pendingPayload = nil }
-                    Button("儲存") { 
-                        guard let payload = pendingPayload else { return }
-                        savePayloadByType(payload: payload, name: newDeviceName)
-                    }   
-                } message: {
-                    Text("偵測到新的 VS Code 實例，請為其命名以方便識別。")
-                }
-                .onReceive(timer) { _ in updateTOTP() }
-                .onAppear {
-                    // 如果 Gist ID 為空，載入預設值 (解決 AppStorage 保留舊空值的問題)
-                    if gistId.isEmpty { gistId = "YOUR_DEFAULT_GIST_ID" }
-                    
-                    if selectedDevice == nil { selectedDevice = devices.first }
-                    updateTOTP()
-                }
-        }
-    }
-
-    var mainList: some View {
-        List {
-            exportSection
-            teamSection
-            deviceSection
-        }
-        .listStyle(.insetGrouped)
-    }
+    
+    let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var displayedTeam: [PokemonDisplayModel] {
         if let history = selectedHistory,
-           let dtos = try? JSONDecoder().decode([PokemonSyncDTO].self, from: history.teamJson) {
-            return dtos.map { $0.toDisplayModel() }
+           let decoded = try? JSONDecoder().decode([PokemonSyncDTO].self, from: history.teamJson) {
+            return decoded.map { $0.toDisplayModel() }
         }
         return team.map { $0.toDisplayModel() }
     }
-    
-    var currentHashDisplay: String {
-        if let history = selectedHistory {
-            return SyncService.getTimeHash(history.timestamp)
-        }
-        if let latest = histories.first {
-            return SyncService.getTimeHash(latest.timestamp)
-        }
-        return ""
-    }
-    
-    var allHistories: [TeamHistory] {
-        histories
-    }
 
-    var teamSection: some View {
-        Section(header: 
-            HStack {
-                Text("我的隊伍 (\(displayedTeam.count)/6)")
-                    .font(.headline)
-                Spacer()
-                if !currentHashDisplay.isEmpty {
-                    Text("#\(currentHashDisplay)")
-                        .font(.system(.caption, design: .monospaced))
-                        .fontWeight(.bold)
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.1))
-                        .cornerRadius(4)
-                }
-            }
-        ) {
-            ForEach(displayedTeam) { pokemon in
-                PokemonListRow(pokemon: pokemon)
-                    .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
-            }
+    var body: some View {
+        ZStack {
+            // 背景：深紫色系 LCD 質感
+            Color.archiveBG.ignoresSafeArea()
             
-            if displayedTeam.isEmpty {
-                Text("目前隊伍中沒有寶可夢")
-                    .foregroundColor(.secondary)
-                    .font(.caption)
-            }
-        }
-    }
-
-    var deviceSection: some View {
-        Section(header: Text("已綁定設備").font(.headline)) {
-            if devices.isEmpty {
-                Text("尚未綁定任何 VS Code 實例").font(.caption).foregroundColor(.secondary)
-            } else {
-                ForEach(devices) { device in
-                    DeviceListRow(device: device, totpCode: (device == selectedDevice) ? totpCode : "------", timeRemaining: timeRemaining)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            selectedDevice = device
-                            updateTOTP()
-                        }
-                        .listRowBackground(selectedDevice == device ? Color.blue.opacity(0.1) : Color.clear)
-                }
-            }
-        }
-    }
-
-    var exportSection: some View {
-        Section(header: Text("資料管理")) {
-            HStack {
-                // 左側：版本選擇 (下拉選單)
-                Picker("版本", selection: $selectedHistory) {
-                    Text("最新").tag(nil as TeamHistory?)
-                    ForEach(allHistories) { history in
-                        let hash = SyncService.getTimeHash(history.timestamp)
-                        Text("v\(history.lockId) [\(hash)] (\(formatDate(history.timestamp)))").tag(history as TeamHistory?)
+            // 掃描線紋理
+            ScanlineOverlay().opacity(0.1).ignoresSafeArea()
+            
+            VStack(spacing: 0) {
+                // --- Header: 標題 ---
+                HStack {
+                    PixelIconButton(icon: "gearshape.fill") { showingSettings = true }
+                    Spacer()
+                    Text("PokéCodec")
+                        .font(.system(size: 24, weight: .black, design: .monospaced))
+                        .foregroundColor(.white)
+                    Spacer()
+                    HStack(spacing: 12) {
+                        PixelIconButton(icon: "qrcode.viewfinder") { isShowingScanner = true }
+                        PixelIconButton(icon: "square.and.arrow.up") { exportData() }
                     }
                 }
-                .labelsHidden()
-                .pickerStyle(.menu)
+                .padding(.horizontal, 20)
+                .padding(.top, 15)
+                .padding(.bottom, 25)
                 
-                Spacer()
-                
-                // 右側：匯出按鈕 (獨立按鈕)
-                Button(action: { exportData() }) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.headline)
-                        .foregroundColor(.white)
-                        .frame(width: 36, height: 36)
-                        .background(Color.blue)
-                        .clipShape(Circle())
+                ScrollView {
+                    VStack(spacing: 30) {
+                        // --- 隊伍狀態：2x3 網格 ---
+                        VStack(alignment: .leading, spacing: 16) {
+                            // Section Header with Version Picker
+                            HStack {
+                                Text("▶ PARTY STATUS")
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.archiveAccent)
+                                
+                                Spacer()
+                                
+                                // Hash Display (Original Hash)
+                                Text(selectedHistory != nil ? "#\(SyncService.getTimeHash(selectedHistory!.timestamp))" : (histories.first != nil ? "#\(SyncService.getTimeHash(histories.first!.timestamp))" : "---"))
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.gray)
+                                    .padding(.trailing, 8)
+
+                                // Version Picker (Menu)
+                                Menu {
+                                    Button("最新") { selectedHistory = nil }
+                                    ForEach(histories) { history in
+                                        Button("v\(history.lockId)") { selectedHistory = history }
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Text("版本")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                        Image(systemName: "chevron.down")
+                                            .font(.system(size: 8))
+                                    }
+                                    .foregroundColor(.archiveAccent)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.black.opacity(0.4))
+                                    .overlay(PixelBorder(color: Color.archiveAccent.opacity(0.5)))
+                                }
+                            }
+                            .padding(.horizontal, 24)
+                            
+                            LazyVGrid(columns: [
+                                GridItem(.flexible(), spacing: 10),
+                                GridItem(.flexible(), spacing: 10),
+                                GridItem(.flexible(), spacing: 10)
+                            ], spacing: 10) {
+                                ForEach(0..<6, id: \.self) { index in
+                                    if index < displayedTeam.count {
+                                        PixelPokemonGridCard(pokemon: displayedTeam[index])
+                                    } else {
+                                        PixelEmptySlot()
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 20)
+                        }
+                        
+                        // --- 連結終端 ---
+                        if !devices.isEmpty {
+                            VStack(alignment: .leading, spacing: 16) {
+                                SectionHeader(title: "LINKED TERMINALS", count: nil)
+                                
+                                ForEach(devices) { device in
+                                    PixelTerminalRow(
+                                        device: device,
+                                        timeRemaining: timeRemaining,
+                                        totpManager: totpManager
+                                    )
+                                    .onTapGesture {
+                                        selectedDevice = device
+                                        updateTOTP()
+                                    }
+                                    .padding(.horizontal, 20)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.bottom, 40)
                 }
-                .buttonStyle(.borderless)
             }
+            if showingExportAlert {
+                ExportPopup(isShowing: $showingExportAlert, dataString: exportedString)
+                    .zIndex(100)
+            }
+        }
+        .onReceive(timer) { _ in updateTOTP() }
+        .sheet(isPresented: $isShowingScanner) { 
+            ScannerSheet(isShowing: $isShowingScanner) { handleQRCodeScanned($0) } 
+        }
+        .sheet(isPresented: $showingSettings) { 
+            SettingsView(githubToken: $githubToken, gistId: $gistId, onReset: resetAll) 
+        }
+        .alert("設備命名", isPresented: $showingDeviceNameInput) {
+            TextField("輸入名稱", text: $newDeviceName)
+            Button("儲存") { 
+                guard let payload = pendingPayload else { return }
+                savePayloadByType(payload: payload, name: newDeviceName)
+            }   
         }
     }
 
-    // MARK: - Helper Functions (邏輯與原本雷同，稍作整理)
+    // MARK: - Logic (Restored)
     
-    func updateTOTP() {
-        guard let device = selectedDevice,
-              let secretData = Data.fromBase32(device.secret) else {
-            totpCode = "--- ---"
-            return
-        }
+    private func updateTOTP() {
         let now = Date().timeIntervalSince1970
         timeRemaining = 30 - (Int(now) % 30)
-        totpCode = totpManager.generateCode(secretData: secretData) ?? "--- ---"
+        
+        // 這裡不再只更新單一 totpCode，而是讓 View 自行計算
+        // 但為了相容舊邏輯，我們還是保留這個方法來觸發 UI 更新
     }
 
-    func exportData() {
-        let dtos: [PokemonSyncDTO]
-        let lockId: Int
-        let timestamp: Double
-        
-        if let history = selectedHistory {
-            // Export from history
-            guard let historyDtos = try? JSONDecoder().decode([PokemonSyncDTO].self, from: history.teamJson) else {
-                print("Failed to decode history")
-                return
-            }
-            dtos = historyDtos
-            lockId = history.lockId
-            timestamp = history.timestamp
-        } else {
-            // Export current
-            dtos = team.map { $0.toDTO() }
-            // Use the lockId from the latest history
-            lockId = allHistories.first?.lockId ?? 0
-            timestamp = Date().timeIntervalSince1970
+    private func exportData() {
+        let dtos = team.map { pokemon in
+            PokemonSyncDTO(
+                uid: pokemon.uid,
+                id: pokemon.pokedexId,
+                name: pokemon.name,
+                nickname: pokemon.nickname,
+                level: pokemon.level,
+                currentHp: pokemon.currentHp,
+                maxHp: pokemon.maxHp,
+                ailment: pokemon.ailment,
+                baseStats: pokemon.baseStats,
+                iv: pokemon.iv,
+                ev: pokemon.ev,
+                types: pokemon.types,
+                gender: pokemon.gender,
+                nature: pokemon.nature,
+                ability: pokemon.ability,
+                isHiddenAbility: pokemon.isHiddenAbility,
+                isLegendary: pokemon.isLegendary,
+                isMythical: pokemon.isMythical,
+                height: pokemon.height,
+                weight: pokemon.weight,
+                baseExp: pokemon.baseExp,
+                currentExp: pokemon.currentExp,
+                toNextLevelExp: pokemon.toNextLevelExp,
+                isShiny: pokemon.isShiny,
+                originalTrainer: pokemon.originalTrainer,
+                caughtDate: pokemon.caughtDate,
+                caughtBall: pokemon.caughtBall,
+                heldItem: pokemon.heldItem,
+                pokemonMoves: pokemon.pokemonMoves,
+                codingStats: pokemon.codingStats
+            )
         }
         
-        exportedLockId = lockId
-        
-        let payload = SyncPayload(
-            secret: "", // Secret is not exported
-            type: .party,
-            party: dtos,
-            lockId: lockId,
-            timestamp: timestamp
-        )
-        
-        // ... 編碼與壓縮邏輯 ...
-        if let compressed = try? JSONEncoder().encode(payload).gzipped() {
-            exportedString = "GZIP:" + compressed.base64EncodedString()
+        if let data = try? JSONEncoder().encode(dtos) {
+            exportedString = data.base64EncodedString()
+            exportedLockId = Int(Date().timeIntervalSince1970)
             showingExportAlert = true
         }
     }
-    
-    func formatDate(_ timestamp: Double) -> String {
-        // 判斷是否為毫秒 (若大於 2030 年的秒數，假設為毫秒)
-        let seconds = timestamp > 1893456000 ? timestamp / 1000 : timestamp
-        let date = Date(timeIntervalSince1970: seconds)
-        
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy/MM/dd HH:mm"
-        return formatter.string(from: date)
-    }
-    
-    func savePayloadByType(payload: SyncPayload, name: String) {
 
-        if payload.type == .party && !(payload.party?.isEmpty ?? true) && payload.lockId >= 0 {
-            SyncService.saveParty(payload: payload, context: modelContext, githubToken: githubToken)
-        }else if payload.type == .bindSetup {
-            SyncService.saveDevice(payload: payload, name: name, context: modelContext)
-        }
-        
-        // 重新抓取並設定為選中
-        let descriptor = FetchDescriptor<ConnectedDevice>(predicate: #Predicate<ConnectedDevice> { $0.secret == payload.secret })
-        if let newDevice = try? modelContext.fetch(descriptor).first {
-            self.selectedDevice = newDevice
-        }
-        
-        updateTOTP() // 立即更新
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
-        print("✅ 裝置已儲存/更新，Secret: \(payload.secret)")
-        
-        pendingPayload = nil
-    }
-    
-    func handleQRCodeScanned(_ code: String) {
-        print("📏 掃描到的字串長度：\(code.count)")
-        
-        guard let payload = SyncService.decodePayload(base64: code) else {
-            print("❌ 解碼失敗")
+    private func handleQRCodeScanned(_ code: String) {
+        guard let data = code.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(SyncPayload.self, from: data) else {
             return
         }
-        
-        self.pendingPayload = payload
-        
-        // 檢查裝置是否已存在
-        let secret = payload.secret
-        let descriptor = FetchDescriptor<ConnectedDevice>(
-            predicate: #Predicate<ConnectedDevice> { $0.secret == secret }
-        )
-        
-        do {
-            if let existing = try modelContext.fetch(descriptor).first {
-                // 裝置已存在
-                print("✅ 識別到已知裝置: \(existing.name)")
-                
-                // 如果是單純的 Setup Payload (lockId 為負值)，只更新選中狀態
-                if payload.lockId < 0 {
-                    self.selectedDevice = existing
-                    updateTOTP()
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                    self.pendingPayload = nil
-                    return
-                }
-                
-                // 只有當 party 不為空且 lockId >= 0 時才儲存隊伍
-                savePayloadByType(payload: payload, name: existing.name)
-            } else {
-                // 新裝置，跳出輸入名稱視窗
-                print("🆕 偵測到新裝置")
-                self.newDeviceName = "My VS Code"
-                self.showingDeviceNameInput = true
-            }
-        } catch {
-            print("❌ 檢查裝置失敗: \(error)")
-        }
+        pendingPayload = payload
+        showingDeviceNameInput = true
     }
 
-    func resetAll() {
+    private func savePayloadByType(payload: SyncPayload, name: String) {
+        if payload.type == .bindSetup {
+            let device = ConnectedDevice(
+                secret: payload.secret,
+                name: name,
+                lockId: payload.lockId,
+                timestamp: payload.timestamp ?? Date().timeIntervalSince1970
+            )
+            modelContext.insert(device)
+            selectedDevice = device
+        }
+        pendingPayload = nil
+        showingDeviceNameInput = false
+    }
+
+    private func resetAll() {
         try? modelContext.delete(model: Pokemon.self)
         try? modelContext.delete(model: ConnectedDevice.self)
-        selectedDevice = nil
+        try? modelContext.delete(model: TeamHistory.self)
+        gistId = ""
+        githubToken = ""
     }
 }
 
-// MARK: - Models & Extensions
+// MARK: - 核心像素 UI 元件
+struct GifImage: UIViewRepresentable {
+    let url: URL
+    
+    func makeUIView(context: Context) -> WKWebView {
+        let webView = WKWebView()
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.isScrollEnabled = false
+        webView.isUserInteractionEnabled = false
+        return webView
+    }
+    
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // 使用更嚴謹的 HTML 封裝，並指定 BaseURL 確保圖片能顯示
+        let html = """
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <style>
+                body { 
+                    background-color: transparent; margin: 0; padding: 0; 
+                    display: flex; justify-content: center; align-items: center; 
+                    height: 100vh; overflow: hidden; 
+                }
+                img { 
+                    max-width: 100%; max-height: 100%; 
+                    object-fit: contain; 
+                    image-rendering: pixelated; /* 保持像素感 */
+                }
+            </style>
+        </head>
+        <body>
+            <img src="\(url.absoluteString)" />
+        </body>
+        </html>
+        """
+        uiView.loadHTMLString(html, baseURL: url.deletingLastPathComponent())
+    }
+}
 
-struct PokemonDisplayModel: Identifiable {
-    let id: String
-    let pokedexId: Int
-    let name: String
-    let nickname: String?
-    let level: Int
-    let currentHp: Int
-    let maxHp: Int
-    let isShiny: Bool
-    let linesOfCode: Int
-    let bugsFixed: Int
-    let types: [String]
-    
-    var displayName: String { nickname ?? name }
-    
-    var color: Color {
-        guard let type = types.first?.lowercased() else { return .blue }
-        switch type {
-        case "fire": return .red
-        case "water": return .blue
-        case "grass": return .green
-        case "electric": return .yellow
-        case "psychic": return .purple
-        case "normal": return .gray
-        case "fighting": return .orange
-        case "poison": return .purple
-        case "ground": return .brown
-        case "flying": return .cyan
-        case "bug": return .green
-        case "rock": return .brown
-        case "ghost": return .indigo
-        case "dragon": return .indigo
-        case "steel": return .gray
-        case "ice": return .cyan
-        case "fairy": return .pink
-        default: return .blue
+/// 像素邊框生成器：模擬 RPG 遊戲中的雙重邊框
+struct PixelBorder: View {
+    var color: Color
+    var body: some View {
+        ZStack {
+            Rectangle().stroke(color, lineWidth: 2)
+            Rectangle().stroke(Color.black.opacity(0.3), lineWidth: 4).padding(-2)
         }
     }
 }
 
-extension Pokemon {
-    func toDisplayModel() -> PokemonDisplayModel {
-        PokemonDisplayModel(
-            id: uid,
-            pokedexId: pokedexId,
-            name: name,
-            nickname: nickname,
-            level: level,
-            currentHp: currentHp,
-            maxHp: maxHp,
-            isShiny: isShiny,
-            linesOfCode: linesOfCode,
-            bugsFixed: bugsFixed,
-            types: types
-        )
+struct SectionHeader: View {
+    let title: String
+    let count: String?
+    var body: some View {
+        HStack {
+            Text("▶ \(title)")
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+                .foregroundColor(.archiveAccent)
+            if let count = count {
+                Spacer()
+                Text(count)
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.gray)
+            }
+        }
+        .padding(.horizontal, 24)
     }
 }
 
-extension PokemonSyncDTO {
-    func toDisplayModel() -> PokemonDisplayModel {
-        PokemonDisplayModel(
-            id: uid,
-            pokedexId: id,
-            name: name,
-            nickname: nickname,
-            level: level,
-            currentHp: currentHp,
-            maxHp: maxHp,
-            isShiny: isShiny,
-            linesOfCode: codingStats?.linesOfCode ?? 0,
-            bugsFixed: codingStats?.bugsFixed ?? 0,
-            types: types
-        )
-    }
-}
-
-// MARK: - 子視圖：寶可夢列表列
-struct PokemonListRow: View {
+/// 寶可夢網格卡片：強化像素感與背景深度
+struct PixelPokemonGridCard: View {
     let pokemon: PokemonDisplayModel
     
     var body: some View {
-        HStack(spacing: 15) {
-            // 左側：圖片/圓形背景
-            ZStack {
-                Circle()
-                    .fill(pokemon.color.opacity(0.2))
-                    .frame(width: 60, height: 60)
-                
-                let spriteUrl = pokemon.isShiny 
-                    ? "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/shiny/\(pokemon.pokedexId).png"
-                    : "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/\(pokemon.pokedexId).png"
-
-                AsyncImage(url: URL(string: spriteUrl)) { phase in
-                    switch phase {
-                    case .empty:
-                        ProgressView()
-                    case .success(let image):
-                        image.resizable()
-                             .aspectRatio(contentMode: .fit)
-                    case .failure:
-                        Text(String(pokemon.name.prefix(1)))
-                            .font(.title2).bold()
-                            .foregroundColor(pokemon.color)
-                    @unknown default:
-                        EmptyView()
-                    }
+        VStack(spacing: 0) {
+            // 頂部資訊列 (保持不變)
+            HStack {
+                Text("Lv.\(pokemon.level)")
+                    .font(.system(size: 12, weight: .black, design: .monospaced))
+                    .foregroundColor(.archiveGold)
+                Spacer()
+                if pokemon.isShiny {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 12))
+                        .foregroundColor(.archiveGold)
                 }
-                .frame(width: 50, height: 50)
             }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.2))
             
-            // 右側：詳細資料
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .center) {
-                    Text(pokemon.displayName)
-                        .font(.headline)
-                    
-                    if pokemon.isShiny {
-                        Image(systemName: "sparkles")
-                            .foregroundColor(.yellow)
-                            .font(.caption)
-                    }
-                    
-                    Spacer()
-                    
-                    Text("Lv.\(pokemon.level)")
-                        .font(.system(.caption, design: .monospaced))
-                        .fontWeight(.bold)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.secondary.opacity(0.1))
-                        .cornerRadius(4)
-                }
+            // 圖像顯示區
+            ZStack {
+                // 1. 最底層：背景顏色
+                Rectangle()
+                    .fill(pokemon.typeColor.opacity(0.4))
                 
-                // 血條設計
-                VStack(spacing: 2) {
-                    GeometryReader { geo in
-                        ZStack(alignment: .leading) {
-                            Capsule().fill(Color.gray.opacity(0.2))
-                            
-                            let ratio = Double(pokemon.currentHp) / Double(pokemon.maxHp)
-                            let barColor: Color = ratio > 0.5 ? .green : (ratio > 0.2 ? .yellow : .red)
-                            
-                            Capsule().fill(barColor)
-                                .frame(width: geo.size.width * ratio)
-                        }
-                    }
-                    .frame(height: 8)
-                    
-                    HStack {
-                        Text("\(pokemon.currentHp)/\(pokemon.maxHp) HP")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .foregroundColor(.secondary)
-                        Spacer()
-                    }
+                // 2. 中間層：背景精靈球 (作為浮水印)
+                AsyncImage(url: URL(string: "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/\(pokemon.caughtBall).png")) { img in
+                    img.resizable()
+                        .interpolation(.none)
+                        .aspectRatio(contentMode: .fit)
+                } placeholder: {
+                    Color.clear
+                }
+                .frame(width: 80, height: 80) // 縮小尺寸，不要超過容器
+                .opacity(0.15)               // 降低透明度，讓它更像背景
+                .offset(x: 25, y: 15)        // 稍微偏移到右下角，增加層次感
+                .allowsHitTesting(false)     // 確保背景圖不干擾觸控
+                
+                // 3. 最上層：寶可夢主體 GIF
+                let gifUrlString = pokemon.isShiny 
+                    ? "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/versions/generation-v/black-white/animated/shiny/\(pokemon.pokedexId).gif"
+                    : "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/versions/generation-v/black-white/animated/\(pokemon.pokedexId).gif"
+
+                if let url = URL(string: gifUrlString) {
+                    GifImage(url: url)
+                        .frame(width: 75, height: 75)
+                        .zIndex(10)          // 強制指定最高層級
+                } else {
+                    let pngUrlString = pokemon.isShiny
+                        ? "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/shiny/\(pokemon.pokedexId).png"
+                        : "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/\(pokemon.pokedexId).png"
+
+                    AsyncImage(url: URL(string: pngUrlString)) { img in
+                        img.resizable().interpolation(.none).aspectRatio(contentMode: .fit)
+                    } placeholder: { Color.clear }
+                    .frame(width: 75, height: 75)
+                    .zIndex(10)
                 }
             }
+            .frame(height: 100)
+            .clipped() // 確保內容不會超出這一格
+            
+            // 血條區域 (保持不變)
+            VStack(spacing: 4) {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(Color.black)
+                        let ratio = CGFloat(pokemon.currentHp) / CGFloat(pokemon.maxHp)
+                        Rectangle()
+                            .fill(ratio > 0.5 ? Color.archiveGreen : (ratio > 0.2 ? Color.archiveGold : Color.archiveRed))
+                            .frame(width: max(0, geo.size.width * ratio))
+                    }
+                }
+                .frame(height: 6)
+                .overlay(Rectangle().stroke(Color.white.opacity(0.2), lineWidth: 1))
+            }
+            .padding(10)
+            .background(Color.black.opacity(0.3))
         }
-        .padding(.vertical, 6)
+        .background(Color.archiveCard)
+        .overlay(PixelBorder(color: .white.opacity(0.15)))
+        .shadow(color: .black.opacity(0.4), radius: 0, x: 4, y: 4)
     }
 }
 
-// MARK: - 子視圖：設備列表列
-struct DeviceListRow: View {
+/// 設備行：簡潔但有終端感
+struct PixelTerminalRow: View {
     let device: ConnectedDevice
-    let totpCode: String
     let timeRemaining: Int
+    let totpManager: TOTPManager // 傳入 Manager 以便即時計算
+    @State private var codeWidth: CGFloat = 100
+    
+    var code: String {
+        guard let secretData = Data(base64Encoded: device.secret),
+              let code = totpManager.generateCode(secretData: secretData) else {
+            return "------"
+        }
+        return code // 直接回傳 6 碼，不加空格
+    }
     
     var body: some View {
-        HStack {
-            VStack(alignment: .leading) {
-                Text(device.name)
-                    .font(.body)
-                Text("ID: \(device.lockId)")
-                    .font(.caption2).monospaced()
-                    .foregroundColor(.secondary)
-            }
+        HStack(spacing: 16) {
+            Text(device.name.uppercased())
+                .font(.system(size: 20, weight: .black, design: .monospaced)) // 加大字體
+                .foregroundColor(.archiveAccent)
+                .frame(maxWidth: .infinity, alignment: .leading)
             
-            Spacer()
-            
-            VStack(alignment: .trailing) {
-                Text(totpCode)
-                    .font(.system(.body, design: .monospaced)).bold()
-                    .foregroundColor(.blue)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(code)
+                    .font(.system(size: 26, weight: .black, design: .monospaced))
+                    .foregroundColor(.archiveAccent)
+                    .shadow(color: Color.archiveAccent.opacity(0.5), radius: 2, x: 0, y: 0)
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: WidthPreferenceKey.self, value: geo.size.width)
+                    })
                 
-                // 倒數小進度條
+                // Progress Bar
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
-                        Capsule().fill(Color.gray.opacity(0.2))
-                        Capsule().fill(timeRemaining < 5 ? Color.red : Color.blue)
-                            .frame(width: geo.size.width * CGFloat(Double(timeRemaining) / 30.0))
+                        Rectangle().fill(Color.white.opacity(0.2))
+                        Rectangle().fill(timeRemaining < 5 ? Color.archiveRed : Color.archiveAccent)
+                            .frame(width: geo.size.width * (CGFloat(timeRemaining) / 30.0))
                     }
                 }
-                .frame(width: 60, height: 4)
+                .frame(height: 4)
+                .frame(width: codeWidth)
+            }
+            .onPreferenceChange(WidthPreferenceKey.self) { width in
+                codeWidth = width
             }
         }
+        .padding(16)
+        .background(Color.archiveCard)
+        .overlay(PixelBorder(color: .white.opacity(0.1)))
+    }
+}
+
+struct WidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+struct PixelIconButton: View {
+    let icon: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .bold))
+                .foregroundColor(.white)
+                .frame(width: 40, height: 40)
+                .background(Color.archiveCard)
+                .overlay(PixelBorder(color: .white.opacity(0.2)))
+                .shadow(color: .black, radius: 0, x: 2, y: 2)
+        }
+    }
+}
+
+struct ScanlineOverlay: View {
+    var body: some View {
+        GeometryReader { geo in
+            Path { path in
+                for y in stride(from: 0, to: geo.size.height, by: 4) {
+                    path.move(to: CGPoint(x: 0, y: y))
+                    path.addLine(to: CGPoint(x: geo.size.width, y: y))
+                }
+            }
+            .stroke(Color.black, lineWidth: 1)
+        }
+    }
+}
+
+// MARK: - 輔助 View 與 Sheet
+struct PixelEmptyView: View {
+    var body: some View {
+        VStack(spacing: 15) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 30))
+                .foregroundColor(.white.opacity(0.1))
+            Text("NO PARTY DATA")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.2))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 60)
+        .background(Color.black.opacity(0.2))
+        .overlay(PixelBorder(color: .white.opacity(0.05)))
+        .padding(.horizontal, 20)
+    }
+}
+
+struct PixelEmptySlot: View {
+    var body: some View {
+        VStack {
+            Image(systemName: "plus")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundColor(.white.opacity(0.1))
+        }
+        .frame(height: 140) // Match card height roughly
+        .frame(maxWidth: .infinity)
+        .background(Color.black.opacity(0.1))
+        .overlay(
+            RoundedRectangle(cornerRadius: 0)
+                .stroke(style: StrokeStyle(lineWidth: 2, dash: [5]))
+                .foregroundColor(.white.opacity(0.1))
+        )
     }
 }
 
@@ -534,29 +545,122 @@ struct ScannerSheet: View {
     let onScan: (String) -> Void
     
     var body: some View {
-        VStack {
-            HStack {
-                Text("掃描 QR Code").font(.headline)
-                Spacer()
-                Button("關閉") { isShowing = false }
+        ZStack {
+            // 背景：深紫色系 LCD 質感
+            Color.archiveBG.ignoresSafeArea()
+            ScanlineOverlay().opacity(0.1).ignoresSafeArea()
+            
+            VStack(spacing: 0) {
+                // Header
+                HStack {
+                    Text("▶ SCANNER_MODULE")
+                        .font(.system(size: 16, weight: .black, design: .monospaced))
+                        .foregroundColor(.archiveAccent)
+                    
+                    Spacer()
+                    
+                    Button(action: { isShowing = false }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 32, height: 32)
+                            .background(Color.archiveCard)
+                            .overlay(PixelBorder(color: .white.opacity(0.2)))
+                    }
+                }
+                .padding(20)
+                .background(Color.archiveCard)
+                .overlay(Rectangle().frame(height: 2).foregroundColor(Color.black.opacity(0.5)), alignment: .bottom)
+                
+                // Scanner Container
+                ZStack {
+                    // Scanner View
+                    ScannerView(isScanning: $isShowing, onScanResult: onScan)
+                        .clipShape(RoundedRectangle(cornerRadius: 0))
+                        .overlay(PixelBorder(color: Color.archiveAccent.opacity(0.3)))
+                    
+                    // Viewfinder Overlay
+                    ZStack {
+                        Rectangle()
+                            .stroke(Color.archiveAccent.opacity(0.5), style: StrokeStyle(lineWidth: 2, dash: [10]))
+                            .padding(10)
+                        
+                        // Corners
+                        VStack {
+                            HStack {
+                                CornerBracket()
+                                Spacer()
+                                CornerBracket().rotationEffect(.degrees(90))
+                            }
+                            Spacer()
+                            HStack {
+                                CornerBracket().rotationEffect(.degrees(-90))
+                                Spacer()
+                                CornerBracket().rotationEffect(.degrees(180))
+                            }
+                        }
+                        .padding(10)
+                    }
+                }
+                .padding(20)
+                .frame(maxHeight: .infinity)
+                
+                // Footer Text
+                Text("ALIGN QR CODE WITHIN FRAME")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.5))
+                    .padding(.bottom, 30)
             }
-            .padding()
+        }
+    }
+}
 
-            #if targetEnvironment(simulator)
-            ContentUnavailableView("不支援掃描",
-                                   systemImage: "camera.fill",
-                                   description: Text("請使用實體 iPhone 進行測試，模擬器不支援 VisionKit 掃描器。"))
-            #else
-            if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
-                ScannerView(isScanning: $isShowing, onScanResult: onScan)
-                    .cornerRadius(12)
-                    .padding()
-            } else {
-                ContentUnavailableView("不支援掃描",
-                                       systemImage: "camera.fill",
-                                       description: Text("此裝置不支援 VisionKit 掃描器。"))
+struct CornerBracket: View {
+    var body: some View {
+        Path { path in
+            path.move(to: CGPoint(x: 0, y: 20))
+            path.addLine(to: CGPoint(x: 0, y: 0))
+            path.addLine(to: CGPoint(x: 20, y: 0))
+        }
+        .stroke(Color.archiveAccent, lineWidth: 4)
+        .frame(width: 20, height: 20)
+    }
+}
+
+struct ExportPopup: View {
+    @Binding var isShowing: Bool
+    let dataString: String
+    
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.6).ignoresSafeArea()
+                .onTapGesture { isShowing = false }
+            
+            VStack(spacing: 16) {
+                Text("EXPORT DATA")
+                    .font(.system(size: 16, weight: .black, design: .monospaced))
+                    .foregroundColor(.white)
+                
+                Button(action: {
+                    UIPasteboard.general.string = dataString
+                    isShowing = false
+                }) {
+                    HStack {
+                        Image(systemName: "doc.on.doc")
+                        Text("COPY TO CLIPBOARD")
+                    }
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.archiveAccent)
+                    .overlay(PixelBorder(color: .white.opacity(0.5)))
+                }
             }
-            #endif
+            .padding(24)
+            .background(Color.archiveCard)
+            .overlay(PixelBorder(color: .archiveAccent))
+            .padding(.horizontal, 40)
         }
     }
 }
@@ -565,77 +669,196 @@ struct SettingsView: View {
     @Binding var githubToken: String
     @Binding var gistId: String
     var onReset: () -> Void
-    @State private var showingResetAlert = false
     @Environment(\.dismiss) var dismiss
     
     var body: some View {
         NavigationView {
-            Form {
-                Section(header: Text("GitHub 設定")) {
-                    SecureField("Personal Access Token", text: $githubToken)
+            ZStack {
+                Color.archiveBG.ignoresSafeArea()
+                ScanlineOverlay().opacity(0.1).ignoresSafeArea()
+                
+                VStack(spacing: 24) {
+                    // Header
+                    HStack {
+                        Text("SYSTEM CONFIG")
+                            .font(.system(size: 20, weight: .black, design: .monospaced))
+                            .foregroundColor(.white)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 20)
                     
-                    VStack(alignment: .leading) {
-                        Text("Gist ID")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        
-                        HStack {
-                            Text((gistId.isEmpty || gistId == "YOUR_DEFAULT_GIST_ID") ? "尚未產生" : gistId)
-                                .font(.system(.body, design: .monospaced))
-                                .foregroundColor((gistId.isEmpty || gistId == "YOUR_DEFAULT_GIST_ID") ? .secondary : .primary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            
-                            Spacer()
-                            
-                            if !gistId.isEmpty && gistId != "YOUR_DEFAULT_GIST_ID" {
-                                Button(action: {
-                                    UIPasteboard.general.string = gistId
-                                }) {
-                                    Image(systemName: "doc.on.doc")
-                                        .foregroundColor(.blue)
+                    ScrollView {
+                        VStack(spacing: 30) {
+                            // Section 1: Credentials
+                            VStack(alignment: .leading, spacing: 16) {
+                                SectionHeader(title: "CREDENTIALS", count: nil)
+                                
+                                VStack(spacing: 12) {
+                                    // Token Input
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("GITHUB TOKEN")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.gray)
+                                        SecureField("Paste Token Here", text: $githubToken)
+                                            .textFieldStyle(PlainTextFieldStyle())
+                                            .font(.system(size: 12, design: .monospaced))
+                                            .foregroundColor(.white)
+                                            .padding(12)
+                                            .background(Color.black.opacity(0.3))
+                                            .overlay(PixelBorder(color: .white.opacity(0.2)))
+                                    }
+                                    
+                                    // Gist ID Input
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("GIST ID")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.gray)
+                                        TextField("Paste Gist ID Here", text: $gistId)
+                                            .textFieldStyle(PlainTextFieldStyle())
+                                            .font(.system(size: 12, design: .monospaced))
+                                            .foregroundColor(.white)
+                                            .autocapitalization(.none)
+                                            .padding(12)
+                                            .background(Color.black.opacity(0.3))
+                                            .overlay(PixelBorder(color: .white.opacity(0.2)))
+                                    }
+                                    
+                                    // GitHub Link Button
+                                    Link(destination: URL(string: "https://github.com/settings/tokens")!) {
+                                        HStack {
+                                            Image(systemName: "link")
+                                            Text("APPLY FOR TOKEN")
+                                        }
+                                        .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.black)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 10)
+                                        .background(Color.archiveAccent)
+                                        .overlay(PixelBorder(color: .white.opacity(0.5)))
+                                    }
                                 }
-                                .buttonStyle(.borderless)
+                                .padding(.horizontal, 20)
+                            }
+                            
+                            // Section 2: Danger Zone
+                            VStack(alignment: .leading, spacing: 16) {
+                                SectionHeader(title: "DANGER ZONE", count: nil)
+                                
+                                Button(action: onReset) {
+                                    HStack {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                        Text("FACTORY RESET")
+                                    }
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                                    .background(Color.archiveRed.opacity(0.8))
+                                    .overlay(PixelBorder(color: .white.opacity(0.2)))
+                                }
+                                .padding(.horizontal, 20)
                             }
                         }
                     }
-                    
-                    if !gistId.isEmpty && gistId != "YOUR_DEFAULT_GIST_ID" {
-                        Button("清除 Gist ID (重新產生)") {
-                            gistId = ""
-                        }
-                        .foregroundColor(.red)
-                    }
-                }
-                
-                Section(footer: Text("Token 需要 Gist 權限以進行雲端備份。")) {
-                    Link("取得 GitHub Token", destination: URL(string: "https://github.com/settings/tokens")!)
-                }
-                
-                Section(header: Text("危險區域")) {
-                    Button(role: .destructive, action: { showingResetAlert = true }) {
-                        HStack {
-                            Image(systemName: "trash")
-                            Text("重置所有資料")
-                        }
-                    }
                 }
             }
-            .navigationTitle("設定")
+            .navigationBarHidden(true)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("DONE") { dismiss() }
+                        .font(.monospaced(.body)())
+                        .foregroundColor(.archiveAccent)
                 }
             }
-            .alert("確定要重置嗎？", isPresented: $showingResetAlert) {
-                Button("取消", role: .cancel) { }
-                Button("刪除", role: .destructive) { 
-                    onReset()
-                    dismiss()
+            .overlay(
+                // Custom Close Button since we hid the nav bar
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button(action: { dismiss() }) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(width: 40, height: 40)
+                                .background(Color.black.opacity(0.5))
+                                .overlay(PixelBorder(color: .white.opacity(0.2)))
+                        }
+                    }
+                    Spacer()
                 }
-            } message: {
-                Text("此動作將刪除所有寶可夢與綁定裝置，且無法復原。")
-            }
+                .padding(20)
+            )
         }
     }
+}
+
+// MARK: - 模型轉換
+struct PokemonDisplayModel: Identifiable {
+    let id: String; let pokedexId: Int; let name: String; let nickname: String?; let level: Int; let currentHp: Int; let maxHp: Int; let isShiny: Bool; let types: [String]; let caughtBall: String
+    var displayName: String { nickname ?? name }
+}
+
+extension PokemonDisplayModel {
+    var typeColor: Color {
+        guard let type = types.first?.lowercased() else { return .gray }
+        switch type {
+        case "normal": return Color(hex: "A8A77A")
+        case "fire": return Color(hex: "EE8130")
+        case "water": return Color(hex: "6390F0")
+        case "electric": return Color(hex: "F7D02C")
+        case "grass": return Color(hex: "7AC74C")
+        case "ice": return Color(hex: "96D9D6")
+        case "fighting": return Color(hex: "C22E28")
+        case "poison": return Color(hex: "A33EA1")
+        case "ground": return Color(hex: "E2BF65")
+        case "flying": return Color(hex: "A98FF3")
+        case "psychic": return Color(hex: "F95587")
+        case "bug": return Color(hex: "A6B91A")
+        case "rock": return Color(hex: "B6A136")
+        case "ghost": return Color(hex: "735797")
+        case "dragon": return Color(hex: "6F35FC")
+        case "steel": return Color(hex: "B7B7CE")
+        case "fairy": return Color(hex: "D685AD")
+        default: return .gray
+        }
+    }
+}
+
+extension Pokemon {
+    func toDisplayModel() -> PokemonDisplayModel {
+        PokemonDisplayModel(id: uid, pokedexId: pokedexId, name: name, nickname: nickname, level: level, currentHp: currentHp, maxHp: maxHp, isShiny: isShiny, types: types, caughtBall: caughtBall)
+    }
+}
+
+extension PokemonSyncDTO {
+    func toDisplayModel() -> PokemonDisplayModel {
+        PokemonDisplayModel(id: uid, pokedexId: id, name: name, nickname: nickname, level: level, currentHp: currentHp, maxHp: maxHp, isShiny: isShiny, types: types, caughtBall: caughtBall)
+    }
+}
+
+extension Color {
+    init(hex: String) {
+        let scanner = Scanner(string: hex)
+        var rgbValue: UInt64 = 0
+        scanner.scanHexInt64(&rgbValue)
+        self.init(red: Double((rgbValue & 0xFF0000) >> 16) / 255, green: Double((rgbValue & 0x00FF00) >> 8) / 255, blue: Double(rgbValue & 0x0000FF) / 255)
+    }
+
+    // 主背景：溫暖的碳黑 (不帶藍調，護眼)
+    static let archiveBG = Color(hex: "1C1C1C")
+    
+    // 卡片背景：深泥灰色
+    static let archiveCard = Color(hex: "2D2D2D")
+    
+    // 主強調色：羊皮紙黃 (取代原本刺眼的青色)
+    static let archiveAccent = Color(hex: "EADBB2")
+    
+    // 次要資訊：亞麻灰
+    static let archiveSecondary = Color(hex: "A89984")
+    
+    // 狀態顏色：低飽和度
+    static let archiveGreen = Color(hex: "98971A") // 橄欖綠
+    static let archiveRed = Color(hex: "CC241D")   // 鐵鏽紅
+    static let archiveGold = Color(hex: "D79921")  // 舊金色 (用於 Lv. 和 閃光)
 }
