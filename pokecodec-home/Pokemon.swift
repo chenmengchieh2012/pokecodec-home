@@ -43,6 +43,7 @@ struct CodingStats: Codable {
 final class Pokemon {
     // 基礎資訊 (對齊 PokemonDao)
     @Attribute(.unique) var uid: String
+    var slotIndex: Int = 0
     var pokedexId: Int
     var name: String
     var nickname: String?
@@ -88,6 +89,7 @@ final class Pokemon {
 
     init(
         uid: String,
+        slotIndex: Int = 0,
         id: Int,
         name: String,
         nickname: String? = nil,
@@ -121,6 +123,7 @@ final class Pokemon {
         colorHex: String = "3498db"
     ) {
         self.uid = uid
+        self.slotIndex = slotIndex
         self.pokedexId = id
         self.name = name
         self.nickname = nickname
@@ -222,4 +225,44 @@ final class Pokemon {
             codingStats: codingStats
         )
     }
+}
+
+
+
+// 對齊 pokemon.ts 的 JSON 結構
+struct PokemonSyncDTO: Codable {
+    let uid: String
+    let id: Int
+    let name: String
+    let nickname: String?
+    let level: Int
+    let currentHp: Int
+    let maxHp: Int
+    let ailment: String?
+    
+    let baseStats: PokemonStats
+    let iv: PokemonStats
+    let ev: PokemonStats
+    
+    let types: [String]
+    let gender: String
+    let nature: String
+    let ability: String
+    let isHiddenAbility: Bool
+    let isLegendary: Bool
+    let isMythical: Bool
+    let height: Double
+    let weight: Double
+    let baseExp: Int
+    let currentExp: Int
+    let toNextLevelExp: Int
+    let isShiny: Bool
+    
+    let originalTrainer: String
+    let caughtDate: Double
+    let caughtBall: String
+    let heldItem: String?
+    
+    let pokemonMoves: [PokemonMove]
+    let codingStats: CodingStats?
 }

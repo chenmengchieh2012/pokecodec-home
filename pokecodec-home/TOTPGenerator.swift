@@ -7,6 +7,15 @@ import Foundation
 class TOTPManager: ObservableObject {
     let period: TimeInterval = 30
     
+    /// 支援 Base32 字串輸入的生成方法
+    func generateCode(secretBase32: String) -> String? {
+        // 使用 Data 擴充方法 fromBase32
+        guard let secretData = Data.fromBase32(secretBase32) else {
+            return nil
+        }
+        return generateCode(secretData: secretData)
+    }
+    
     func generateCode(secretData: Data) -> String? {
         let counter = UInt64(Date().timeIntervalSince1970 / period)
         var bigEndianCounter = counter.bigEndian

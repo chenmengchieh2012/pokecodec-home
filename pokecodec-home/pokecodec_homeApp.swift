@@ -14,6 +14,6 @@ struct pokecodec_homeApp: App {
         WindowGroup {
             ContentView()
         }// 指定我們要使用的資料模型
-        .modelContainer(for: [Pokemon.self, ConnectedDevice.self, TeamHistory.self])
+        .modelContainer(for: [Pokemon.self, ConnectedDevice.self, TeamHistory.self, PokeBox.self])
     }
 }

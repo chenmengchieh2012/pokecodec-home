@@ -2,54 +2,16 @@ import Foundation
 import SwiftData
 import CryptoKit
 
-// 對齊 pokemon.ts 的 JSON 結構
-struct PokemonSyncDTO: Codable {
-    let uid: String
-    let id: Int
-    let name: String
-    let nickname: String?
-    let level: Int
-    let currentHp: Int
-    let maxHp: Int
-    let ailment: String?
-    
-    let baseStats: PokemonStats
-    let iv: PokemonStats
-    let ev: PokemonStats
-    
-    let types: [String]
-    let gender: String
-    let nature: String
-    let ability: String
-    let isHiddenAbility: Bool
-    let isLegendary: Bool
-    let isMythical: Bool
-    let height: Double
-    let weight: Double
-    let baseExp: Int
-    let currentExp: Int
-    let toNextLevelExp: Int
-    let isShiny: Bool
-    
-    let originalTrainer: String
-    let caughtDate: Double
-    let caughtBall: String
-    let heldItem: String?
-    
-    let pokemonMoves: [PokemonMove]
-    let codingStats: CodingStats?
-}
-
 enum SyncType: String, Codable {
     case party
-    case achievement
+    case box
     case bindSetup
 }
 
 struct SyncPayload: Codable {
     let secret: String
     let type: SyncType?
-    let party: [PokemonSyncDTO]?
+    let transferPokemons: [PokemonSyncDTO]?
     let lockId: Int
     let timestamp: Double?
 }
@@ -92,6 +54,20 @@ struct SyncService {
     }
     
     @MainActor
+    static func processPayload(payload: SyncPayload, name: String, context: ModelContext, settings: SecureSettings) -> ConnectedDevice? {
+        if payload.type == .party && !(payload.transferPokemons?.isEmpty ?? true) && payload.lockId >= 0 {
+            saveParty(payload: payload, context: context, githubToken: settings.githubToken, gistId: settings.gistId)
+        } else if payload.type == .box {
+            saveBoxPokemon(payload: payload, context: context)
+        } else if payload.type == .bindSetup {
+            saveDevice(payload: payload, name: name, context: context)
+        }
+        
+        let descriptor = FetchDescriptor<ConnectedDevice>(predicate: #Predicate<ConnectedDevice> { $0.secret == payload.secret })
+        return try? context.fetch(descriptor).first
+    }
+    
+    @MainActor
     static func saveDevice(payload: SyncPayload, name: String, context: ModelContext) {
         let secret = payload.secret
         let descriptor = FetchDescriptor<ConnectedDevice>(
@@ -128,9 +104,10 @@ struct SyncService {
     }
 
     @MainActor // 確保在主執行緒執行，UI 才能即時反應
-    static func saveParty(payload: SyncPayload, context: ModelContext, githubToken: String, gistIdKey: String = "PokecodecGistId") {
-        guard let dtos = payload.party else {
+    static func saveParty(payload: SyncPayload, context: ModelContext, githubToken: String, gistId: String, completion: ((Bool) -> Void)? = nil) {
+        guard let dtos = payload.transferPokemons else {
             print("⚠️ Payload 中沒有隊伍資料，跳過儲存隊伍")
+            completion?(false)
             return
         }
         print("📦 開始儲存 \(dtos.count) 隻寶可夢數據")
@@ -140,10 +117,11 @@ struct SyncService {
             try context.delete(model: Pokemon.self)
             
             // 2. 插入新數據
-            for dto in dtos {
+            for (index, dto) in dtos.enumerated() {
                 print("🆕 插入新成員: \(dto.name)")
                 let new = Pokemon(
                     uid: dto.uid,
+                    slotIndex: index,
                     id: dto.id,
                     name: dto.name,
                     nickname: dto.nickname,
@@ -182,7 +160,7 @@ struct SyncService {
                let timestamp = payload.timestamp,
                let teamData = try? JSONEncoder().encode(dtos) {
                 
-                let history = TeamHistory(timestamp: timestamp, lockId: payload.lockId, teamJson: teamData)
+                let history = TeamHistory(timestamp: timestamp, lockId: payload.lockId, teamJson: teamData, isSynced: false)
                 context.insert(history)
                 
                 // 檢查數量並刪除舊的
@@ -195,7 +173,7 @@ struct SyncService {
                             // 同步刪除 Gist 上的檔案
                             let hash = getTimeHash(item.timestamp)
                             let filename = "pokecodec-party-\(hash).txt"
-                            deleteFromGist(filename: filename, token: githubToken, gistIdKey: gistIdKey) { result in
+                            deleteFromGist(filename: filename, token: githubToken, gistId: gistId) { result in
                                 if case .failure(let error) = result {
                                     print("❌ Failed to delete file from Gist: \(error)")
                                 } else {
@@ -210,7 +188,7 @@ struct SyncService {
                 let exportPayload = SyncPayload(
                     secret: "", 
                     type: payload.type,
-                    party: payload.party,
+                    transferPokemons: payload.transferPokemons,
                     lockId: payload.lockId,
                     timestamp: timestamp
                 )
@@ -220,15 +198,26 @@ struct SyncService {
                     let hash = getTimeHash(timestamp)
                     let filename = "pokecodec-party-\(hash).txt"
                     
-                    uploadToGist(content: content, filename: filename, token: githubToken, gistIdKey: gistIdKey) { result in
-                        switch result {
-                        case .success(let url):
-                            print("✅ Gist uploaded/updated: \(url)")
-                        case .failure(let error):
-                            print("❌ Gist upload failed: \(error)")
+                    uploadToGist(content: content, filename: filename, token: githubToken, gistId: gistId) { result in
+                        DispatchQueue.main.async {
+                            switch result {
+                            case .success(let url):
+                                print("✅ Gist uploaded/updated: \(url)")
+                                history.isSynced = true
+                                try? context.save()
+                                completion?(true)
+                            case .failure(let error):
+                                print("❌ Gist upload failed: \(error)")
+                                completion?(false)
+                            }
                         }
                     }
+                } else {
+                    completion?(false)
                 }
+            } else {
+                // 如果沒有要上傳 (例如 lockId < 0)，視為成功 (本地儲存成功)
+                completion?(true)
             }
             
             // 修正點 2: 手動提交變更
@@ -237,16 +226,82 @@ struct SyncService {
             
         } catch {
             print("❌ 同步過程出錯: \(error)")
+            completion?(false)
+        }
+    }
+
+    @MainActor
+    static func saveBoxPokemon(payload: SyncPayload, context: ModelContext) {
+        guard let dtos = payload.transferPokemons else {
+            print("⚠️ Payload 中沒有盒子資料，跳過儲存盒子")
+            return
+        }
+        print("📦 開始儲存 \(dtos.count) 隻盒子寶可夢數據")
+
+        do {
+            // 1. 檢查是否有相同uid的寶可夢
+            let existingPokemonsDescriptor = FetchDescriptor<PokeBox>()
+            let existingPokemons = try context.fetch(existingPokemonsDescriptor)
+            var existingDict = [String: PokeBox]()
+            for pokemon in existingPokemons {
+                existingDict[pokemon.uid] = pokemon
+            }
+            // 2. 更新或插入新數據
+            for dto in dtos {
+                if let existing = existingDict[dto.uid] {
+                    print("🔄 更新盒子成員: \(dto.name)")
+                    existing.update(from: dto)
+                } else {
+                    print("🆕 插入新盒子成員: \(dto.name)")
+                    let new = PokeBox(
+                        uid: dto.uid,
+                        pokedexId: dto.id,
+                        name: dto.name,
+                        nickname: dto.nickname,
+                        level: dto.level,
+                        currentHp: dto.currentHp,
+                        maxHp: dto.maxHp,
+                        ailment: dto.ailment,
+                        baseStats: dto.baseStats,
+                        iv: dto.iv,
+                        ev: dto.ev,
+                        types: dto.types,
+                        gender: dto.gender,
+                        nature: dto.nature,
+                        ability: dto.ability,
+                        isHiddenAbility: dto.isHiddenAbility,
+                        isLegendary: dto.isLegendary,
+                        isMythical: dto.isMythical,
+                        height: dto.height,
+                        weight: dto.weight,
+                        baseExp: dto.baseExp,
+                        currentExp: dto.currentExp,
+                        toNextLevelExp: dto.toNextLevelExp,
+                        isShiny: dto.isShiny,
+                        originalTrainer: dto.originalTrainer,
+                        caughtDate: dto.caughtDate,
+                        caughtBall: dto.caughtBall,
+                        heldItem: dto.heldItem,
+                        pokemonMoves: dto.pokemonMoves,
+                        codingStats: dto.codingStats
+                    )
+                    context.insert(new)
+                }
+            }
+            
+            try context.save()
+            print("✅ 盒子數據儲存成功")
+            
+        } catch {
+            print("❌ 儲存盒子數據失敗: \(error)")
         }
     }
     
-    static func uploadToGist(content: String, filename: String, token: String, gistIdKey: String, completion: @escaping (Result<URL, Error>) -> Void) {
-        let storedGistId = UserDefaults.standard.string(forKey: gistIdKey)
-        
+    static func uploadToGist(content: String, filename: String, token: String, gistId: String, completion: @escaping (Result<URL, Error>) -> Void) {
         let url: URL
         let method: String
         
-        if let gistId = storedGistId {
+        if !gistId.isEmpty {
             url = URL(string: "https://api.github.com/gists/\(gistId)")!
             method = "PATCH"
         } else {
@@ -286,8 +341,9 @@ struct SyncService {
             if let httpResponse = response as? HTTPURLResponse {
                 if httpResponse.statusCode == 404 && method == "PATCH" {
                     // Gist ID 失效，清除並重試 (遞迴呼叫會變成 POST)
-                    UserDefaults.standard.removeObject(forKey: gistIdKey)
-                    uploadToGist(content: content, filename: filename, token: token, gistIdKey: gistIdKey, completion: completion)
+                    // 注意：這裡無法直接清除 Keychain，因為 SyncService 是靜態的且不依賴 KeychainHelper
+                    // 我們只能嘗試用空 ID 重新上傳 (POST)
+                    uploadToGist(content: content, filename: filename, token: token, gistId: "", completion: completion)
                     return
                 }
                 
@@ -298,25 +354,30 @@ struct SyncService {
                 }
             }
             
-            guard let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let htmlUrlString = json["html_url"] as? String,
-                  let htmlUrl = URL(string: htmlUrlString),
-                  let id = json["id"] as? String else {
-                completion(.failure(NSError(domain: "GistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to parse response"])))
-                return
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let htmlUrl = json["html_url"] as? String,
+               let newGistId = json["id"] as? String,
+               let url = URL(string: htmlUrl) {
+                
+                // 如果是新建立的 Gist，需要通知外部更新 ID
+                if method == "POST" {
+                    DispatchQueue.main.async {
+                        KeychainHelper.shared.save(newGistId, account: "gistId")
+                    }
+                }
+                
+                completion(.success(url))
+            } else {
+                completion(.failure(NSError(domain: "GistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid response"])))
             }
-            
-            // 儲存 Gist ID 以供下次更新使用
-            UserDefaults.standard.set(id, forKey: gistIdKey)
-            
-            completion(.success(htmlUrl))
-        }.resume()
+        }
+        .resume()
     }
     
-    static func deleteFromGist(filename: String, token: String, gistIdKey: String, completion: @escaping (Result<Bool, Error>) -> Void) {
-        guard let gistId = UserDefaults.standard.string(forKey: gistIdKey) else {
-            completion(.failure(NSError(domain: "GistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "No Gist ID found"])))
+    static func deleteFromGist(filename: String, token: String, gistId: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !gistId.isEmpty else {
+            completion(.failure(NSError(domain: "GistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "No Gist ID"])))
             return
         }
         
@@ -327,7 +388,7 @@ struct SyncService {
         request.addValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.addValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         
-        // To delete a file, set it to null
+        // 刪除檔案的方式是將內容設為 null
         let body: [String: Any] = [
             "files": [
                 filename: NSNull()
@@ -352,7 +413,8 @@ struct SyncService {
                 return
             }
             
-            completion(.success(true))
-        }.resume()
+            completion(.success(()))
+        }
+        .resume()
     }
 }
